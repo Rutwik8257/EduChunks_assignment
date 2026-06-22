@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #fff; display: flex; flex-direction: column; height: 100vh; }
+
+  #toolbar {
+    display: flex;
+    gap: 4px;
+    padding: 7px 8px;
+    background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .sep { width: 1px; background: #e2e8f0; height: 20px; margin: 0 2px; }
+
+  button {
+    width: 30px; height: 26px;
+    border: 1px solid #cbd5e1;
+    border-radius: 4px;
+    background: #fff;
+    cursor: pointer;
+    font-size: 13px;
+    color: #334155;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
+    display: flex; align-items: center; justify-content: center;
+  }
+  button.active { background: #dbeafe; border-color: #3b82f6; color: #1d4ed8; }
+  button:hover:not(.active) { background: #f1f5f9; }
+  #word-count {
+    margin-left: auto;
+    font-size: 10px;
+    color: #94a3b8;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  #sync-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: #22c55e;
+    margin-left: 6px;
+    flex-shrink: 0;
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+  #sync-dot.flash { opacity: 1; }
+
+  #editor {
+    padding: 14px;
+    flex: 1;
+    outline: none;
+    font-size: 15px;
+    line-height: 1.7;
+    overflow-y: auto;
+    color: #1e293b;
+  }
+
+  /* Highlight pulse on received sync */
+  @keyframes syncPulse {
+    0%   { background: #f0fdf4; }
+    100% { background: #fff; }
+  }
+  #editor.synced { animation: syncPulse 0.6s ease-out; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <button id="btn-bold"   title="Bold (Ctrl+B)"><b>B</b></button>
+  <button id="btn-italic" title="Italic (Ctrl+I)"><i>I</i></button>
+  <button id="btn-strike" title="Strikethrough (Ctrl+Shift+X)"><s>S</s></button>
+  <div class="sep"></div>
+  <button id="btn-undo"   title="Undo (Ctrl+Z)">↩</button>
+  <button id="btn-redo"   title="Redo (Ctrl+Y)">↪</button>
+  <span id="word-count">0w · 0c</span>
+  <span id="sync-dot"></span>
+</div>
+
+<div id="editor" contenteditable="true">
+  The <strong>quick</strong> brown fox jumps over the <em>lazy</em> dog.
+</div>
+
+<script>
+  const editor   = document.getElementById('editor');
+  const syncDot  = document.getElementById('sync-dot');
+  const wc       = document.getElementById('word-count');
+  const buttons  = {
+    bold:          document.getElementById('btn-bold'),
+    italic:        document.getElementById('btn-italic'),
+    strikeThrough: document.getElementById('btn-strike'),
+  };
+
+  let receiving  = false;
+  let inputTimer = null;
+
+  // ── Word / char counter ───────────────────────────────────────────────────
+  function updateCounter() {
+    const text  = editor.innerText.trim();
+    const words = text ? text.split(/\s+/).length : 0;
+    const chars = text.replace(/\s/g, '').length;
+    wc.textContent = `${words}w · ${chars}c`;
+  }
+
+  // ── Toolbar state ─────────────────────────────────────────────────────────
+  function updateToolbar() {
+    buttons.bold.classList.toggle('active',          document.queryCommandState('bold'));
+    buttons.italic.classList.toggle('active',        document.queryCommandState('italic'));
+    buttons.strikeThrough.classList.toggle('active', document.queryCommandState('strikeThrough'));
+    updateCounter();
+  }
+
+  editor.addEventListener('mouseup',        updateToolbar);
+  editor.addEventListener('keyup',          updateToolbar);
+  document.addEventListener('selectionchange', updateToolbar);
+
+  // ── Format & broadcast ────────────────────────────────────────────────────
+  function applyFormat(action) {
+    editor.focus();
+    document.execCommand(action);
+    updateToolbar();
+    if (!receiving) broadcast('FORMAT_SYNC', { action, html: editor.innerHTML });
+  }
+
+  buttons.bold.addEventListener('click',   () => applyFormat('bold'));
+  buttons.italic.addEventListener('click', () => applyFormat('italic'));
+  buttons.strikeThrough.addEventListener('click', () => applyFormat('strikeThrough'));
+
+  document.getElementById('btn-undo').addEventListener('click', () => doUndoRedo('undo'));
+  document.getElementById('btn-redo').addEventListener('click', () => doUndoRedo('redo'));
+
+  // ── Keyboard shortcuts ────────────────────────────────────────────────────
+  editor.addEventListener('keydown', (e) => {
+    if (e.ctrlKey || e.metaKey) {
+      if (e.key === 'b') { e.preventDefault(); applyFormat('bold'); }
+      if (e.key === 'i') { e.preventDefault(); applyFormat('italic'); }
+      if (e.key === 'z') { e.preventDefault(); doUndoRedo('undo'); }
+      if (e.key === 'y') { e.preventDefault(); doUndoRedo('redo'); }
+      if (e.shiftKey && e.key === 'X') { e.preventDefault(); applyFormat('strikeThrough'); }
+    }
+  });
+
+  // ── Undo / redo sync ──────────────────────────────────────────────────────
+  function doUndoRedo(action) {
+    editor.focus();
+    document.execCommand(action);
+    updateToolbar();
+    if (!receiving) broadcast('UNDO_REDO_SYNC', { action, html: editor.innerHTML });
+  }
+
+  // ── Text input sync (debounced 300 ms) ────────────────────────────────────
+  editor.addEventListener('input', () => {
+    updateCounter();
+    if (receiving) return;
+    clearTimeout(inputTimer);
+    inputTimer = setTimeout(() => {
+      broadcast('TEXT_SYNC', { html: editor.innerHTML });
+    }, 300);
+  });
+
+  // ── Broadcast helper ──────────────────────────────────────────────────────
+  function broadcast(type, payload) {
+    window.parent.postMessage({ type, ...payload, ts: Date.now() }, '*');
+  }
+
+  // ── Receive sync from host ────────────────────────────────────────────────
+  window.addEventListener('message', (e) => {
+    if (e.source !== window.parent) return;
+    const { type, html } = e.data;
+    if (!['FORMAT_SYNC', 'TEXT_SYNC', 'UNDO_REDO_SYNC'].includes(type)) return;
+
+    receiving = true;
+    applyIncomingHTML(html);
+    updateToolbar();
+    flashSyncDot();
+    receiving = false;
+  });
+
+  function applyIncomingHTML(html) {
+    // Save cursor offset (character-based) to survive innerHTML replacement
+    const offset = getCaretCharOffset(editor);
+    editor.innerHTML = html;
+    setCaretCharOffset(editor, offset);
+
+    // Pulse the editor background
+    editor.classList.remove('synced');
+    void editor.offsetWidth; // reflow to restart animation
+    editor.classList.add('synced');
+  }
+
+  function flashSyncDot() {
+    syncDot.classList.add('flash');
+    clearTimeout(syncDot._t);
+    syncDot._t = setTimeout(() => syncDot.classList.remove('flash'), 900);
+  }
+
+  // ── Cursor preservation (char-offset based) ───────────────────────────────
+  function getCaretCharOffset(el) {
+    const sel = window.getSelection();
+    if (!sel.rangeCount) return 0;
+    const range = sel.getRangeAt(0).cloneRange();
+    range.selectNodeContents(el);
+    range.setEnd(sel.getRangeAt(0).endContainer, sel.getRangeAt(0).endOffset);
+    return range.toString().length;
+  }
+
+  function setCaretCharOffset(el, offset) {
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let remaining = offset;
+    let node;
+    while ((node = walker.nextNode())) {
+      if (remaining <= node.length) {
+        const range = document.createRange();
+        const sel   = window.getSelection();
+        range.setStart(node, remaining);
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        return;
+      }
+      remaining -= node.length;
+    }
+  }
+
+  // Init counter
+  updateCounter();
+</script>
+</body>
+</html>
